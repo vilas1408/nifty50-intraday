@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import time
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Nifty50 Intraday Predictor", layout="wide")
 
@@ -24,7 +25,6 @@ def safe_download(ticker, period="5d", interval="5m"):
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
         if df.empty:
-            st.warning(f"⚠️ No data for {ticker}")
             return None
         df = df.reset_index()
         df["Ticker"] = ticker
@@ -50,11 +50,36 @@ def predict_next_day(df):
     except Exception:
         return "HOLD"
 
+def plot_chart(df, ticker):
+    """Plot candlestick with SMA overlays"""
+    fig = go.Figure()
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df["Datetime"],
+        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Price"
+    ))
+
+    # Moving Averages
+    if "SMA_5" in df.columns:
+        fig.add_trace(go.Scatter(x=df["Datetime"], y=df["SMA_5"], line=dict(color="blue", width=1.5), name="SMA 5"))
+    if "SMA_20" in df.columns:
+        fig.add_trace(go.Scatter(x=df["Datetime"], y=df["SMA_20"], line=dict(color="orange", width=1.5), name="SMA 20"))
+
+    fig.update_layout(
+        title=f"{ticker} - Candlestick Chart with SMA",
+        xaxis_rangeslider_visible=False,
+        height=500,
+        template="plotly_white"
+    )
+    return fig
+
 # ------------------------------
 # Streamlit UI
 # ------------------------------
-st.title("📈 Nifty50 Intraday Predictor")
-st.markdown("Predicts **next-day intraday BUY/SELL signals** from top Nifty50 stocks.")
+st.title("📈 Nifty50 Intraday Predictor with Charts")
+st.markdown("Predicts **next-day intraday BUY/SELL signals** from top Nifty50 stocks + charts.")
 
 tickers = load_tickers("tickers.csv")
 
@@ -77,14 +102,15 @@ else:
         results.append({
             "Ticker": ticker,
             "Last Close": round(df["Close"].iloc[-1], 2),
-            "Signal": signal
+            "Signal": signal,
+            "Data": df
         })
 
         progress.progress((i + 1) / len(tickers))
-        time.sleep(0.5)  # avoid throttling
+        time.sleep(0.2)  # avoid throttling
 
     if results:
-        res_df = pd.DataFrame(results)
+        res_df = pd.DataFrame([{"Ticker": r["Ticker"], "Last Close": r["Last Close"], "Signal": r["Signal"]} for r in results])
         buy_signals = res_df[res_df["Signal"] == "BUY"].sort_values("Last Close", ascending=False)
 
         st.subheader("✅ Top 5 Stocks to BUY Next Day (Intraday)")
@@ -92,5 +118,14 @@ else:
 
         st.subheader("📊 All Predictions")
         st.dataframe(res_df)
+
+        # Chart Viewer
+        st.subheader("📉 Candlestick Charts with Moving Averages")
+        choice = st.selectbox("Select a stock to view chart", res_df["Ticker"].tolist())
+
+        chart_data = next((r["Data"] for r in results if r["Ticker"] == choice), None)
+        if chart_data is not None:
+            fig = plot_chart(chart_data, choice)
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning("No valid data fetched for any ticker.")
