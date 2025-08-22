@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import ta
 from datetime import datetime, timedelta
-from upstox_client import ApiClient, Configuration, MarketQuoteApi, HistoryApi
+from upstox-python import ApiClient, Configuration, MarketQuoteApi, HistoryApi
 
 # -----------------------------
 # Load Upstox credentials
