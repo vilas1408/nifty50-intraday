@@ -1,123 +1,130 @@
-# nifty50_intraday_predictor.py
-
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
-import datetime
+import ta
+from datetime import datetime, timedelta
+from upstox_client import ApiClient, Configuration, MarketQuoteApi, HistoryApi
 
-# Try importing Plotly; fallback to Matplotlib if not available
-try:
-    import plotly.graph_objects as go
-    HAS_PLOTLY = True
-except ImportError:
-    import matplotlib.pyplot as plt
-    HAS_PLOTLY = False
+# -----------------------------
+# Load Upstox credentials
+# -----------------------------
+api_key = st.secrets["upstox"]["api_key"]
+api_secret = st.secrets["upstox"]["api_secret"]
+redirect_uri = st.secrets["upstox"]["redirect_uri"]
+access_token = st.secrets["upstox"]["access_token"]
 
-# -------------------------------
-# Load NIFTY50 tickers
-# -------------------------------
-NIFTY50_TICKERS = [
-    "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
-    "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BPCL.NS","BHARTIARTL.NS",
-    "BRITANNIA.NS","CIPLA.NS","COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS",
-    "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
-    "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
-    "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LTIM.NS",
-    "LT.NS","M&M.NS","MARUTI.NS","NTPC.NS","NESTLEIND.NS","ONGC.NS",
-    "POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SBIN.NS","SUNPHARMA.NS",
-    "TCS.NS","TATACONSUM.NS","TATAMOTORS.NS","TATASTEEL.NS","TECHM.NS",
-    "TITAN.NS","ULTRACEMCO.NS","WIPRO.NS"
+# Configure Upstox API
+config = Configuration()
+config.access_token = access_token
+api_client = ApiClient(config)
+
+history_api = HistoryApi(api_client)
+quote_api = MarketQuoteApi(api_client)
+
+# -----------------------------
+# Nifty50 Stock List
+# -----------------------------
+NIFTY50 = [
+    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "KOTAKBANK",
+    "SBIN", "AXISBANK", "LT", "BHARTIARTL", "ITC", "HINDUNILVR",
+    "ASIANPAINT", "HCLTECH", "SUNPHARMA", "TITAN", "MARUTI", "WIPRO",
+    "BAJFINANCE", "ADANIPORTS", "ONGC", "POWERGRID", "NTPC", "NESTLEIND",
+    "TATASTEEL", "JSWSTEEL", "ULTRACEMCO", "GRASIM", "HEROMOTOCO",
+    "EICHERMOT", "DRREDDY", "CIPLA", "DIVISLAB", "BAJAJFINSV",
+    "BRITANNIA", "M&M", "HINDALCO", "TECHM", "COALINDIA", "BPCL",
+    "IOC", "SHREECEM", "ADANIENT", "LTIM", "UPL", "INDUSINDBK",
+    "HDFCLIFE", "APOLLOHOSP"
 ]
 
-# -------------------------------
-# Data Fetch Function
-# -------------------------------
-@st.cache_data
-def get_data(ticker, period="6mo", interval="1d"):
+# -----------------------------
+# Fetch Historical Data
+# -----------------------------
+def fetch_stock_data(symbol, interval="5minute", days=5):
+    """
+    Fetch OHLCV data for given symbol using Upstox History API.
+    """
     try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, group_by="ticker")
-        if df.empty:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        response = history_api.get_historical_candle_data1(
+            instrument_key=f"NSE_EQ|{symbol}",
+            interval=interval,
+            to_date=end_date.strftime("%Y-%m-%d"),
+            from_date=start_date.strftime("%Y-%m-%d")
+        )
+
+        candles = response.data.candles
+        if not candles:
             return pd.DataFrame()
-        df = df.reset_index()
-        df = df.rename(columns=str.title)  # Normalize column names
-        required_cols = {"Open", "High", "Low", "Close", "Volume"}
-        if not required_cols.issubset(df.columns):
-            return pd.DataFrame()
-        return df
+
+        df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["time"])
+        return df.sort_values("time").reset_index(drop=True)
+
     except Exception as e:
-        st.warning(f"⚠️ Could not fetch {ticker}: {e}")
+        st.warning(f"⚠️ Error fetching {symbol}: {e}")
         return pd.DataFrame()
 
-# -------------------------------
-# Feature Engineering
-# -------------------------------
-def add_features(df):
+# -----------------------------
+# Add Technical Indicators
+# -----------------------------
+def add_indicators(df):
     if df.empty:
         return df
-    out = df.copy()
-    out["ret_close"] = out["Close"].pct_change()
-    out["sma_10"] = out["Close"].rolling(10).mean()
-    out["sma_ratio"] = out["Close"] / out["sma_10"]
-    out["volatility"] = out["ret_close"].rolling(10).std()
-    out = out.dropna()
-    return out
 
-# -------------------------------
-# Prediction Logic (Simple Rule)
-# -------------------------------
-def predict_signal(df):
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+    df["sma20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
+    df["sma50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
+    return df
+
+# -----------------------------
+# Generate Buy/Sell Signals
+# -----------------------------
+def generate_signals(df):
     if df.empty:
-        return "NO DATA"
-    last = df.iloc[-1]
-    if last["Close"] > last["sma_10"] and last["ret_close"] > 0:
+        return None
+
+    latest = df.iloc[-1]
+    if latest["rsi"] < 30 and latest["macd"] > latest["macd_signal"] and latest["sma20"] > latest["sma50"]:
         return "BUY"
-    elif last["Close"] < last["sma_10"] and last["ret_close"] < 0:
+    elif latest["rsi"] > 70 and latest["macd"] < latest["macd_signal"] and latest["sma20"] < latest["sma50"]:
         return "SELL"
     else:
         return "HOLD"
 
-# -------------------------------
-# Streamlit App
-# -------------------------------
-st.title("📈 NIFTY50 Intraday Predictor")
-st.markdown("Predict intraday **Buy / Sell / Hold** signals for NIFTY50 stocks")
+# -----------------------------
+# Streamlit App UI
+# -----------------------------
+st.set_page_config(page_title="Nifty50 Intraday Predictor", layout="wide")
 
-ticker = st.selectbox("Select a NIFTY50 stock", NIFTY50_TICKERS)
+st.title("📈 Nifty50 Intraday Stock Predictor (Upstox API)")
 
-# Fetch data
-df = get_data(ticker, period="6mo", interval="1d")
+st.sidebar.header("Settings")
+interval = st.sidebar.selectbox("Select Interval", ["1minute", "5minute", "15minute", "30minute", "day"], index=1)
+days = st.sidebar.slider("Number of past days", 1, 30, 5)
 
-if df.empty:
-    st.error(f"No data available for {ticker}")
-else:
-    fe_df = add_features(df)
-    signal = predict_signal(fe_df)
-    st.subheader(f"Prediction for next day: **{signal}**")
+if st.sidebar.button("Run Analysis"):
+    results = []
 
-    # Chart
-    st.subheader("Price Chart")
-    if HAS_PLOTLY:
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=df["Date"],
-            open=df["Open"], high=df["High"],
-            low=df["Low"], close=df["Close"],
-            name="Candlestick"
-        ))
-        fig.update_layout(title=f"{ticker} Price Chart", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
+    with st.spinner("Fetching data from Upstox..."):
+        for symbol in NIFTY50:
+            df = fetch_stock_data(symbol, interval=interval, days=days)
+            if df.empty:
+                continue
+            df = add_indicators(df)
+            signal = generate_signals(df)
+            results.append({"Symbol": symbol, "Signal": signal, "Last Price": df["close"].iloc[-1]})
+
+    if results:
+        df_results = pd.DataFrame(results)
+        st.subheader("📊 Stock Predictions")
+        st.dataframe(df_results)
+
+        st.subheader("✅ Suggested BUY Stocks")
+        st.table(df_results[df_results["Signal"] == "BUY"])
+
     else:
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(df["Date"], df["Close"], label="Close Price")
-        ax.plot(fe_df["Date"], fe_df["sma_10"], label="SMA 10", linestyle="--")
-        ax.set_title(f"{ticker} Price Chart")
-        ax.legend()
-        st.pyplot(fig)
-
-# -------------------------------
-# Show Table
-# -------------------------------
-if not df.empty:
-    st.subheader("Recent Data")
-    st.dataframe(df.tail(10))
+        st.error("No data available. Please check API credentials or try again later.")
