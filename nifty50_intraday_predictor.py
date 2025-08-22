@@ -34,7 +34,6 @@ st.caption("Educational prototype. Uses daily data + technical features to class
 # Helper: Load tickers
 # ---------------------------
 DEFAULT_TICKERS = [
-    # Edit this list as needed. Add ".NS" suffix for NSE tickers on Yahoo Finance.
     "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","LT.NS","SBIN.NS","BHARTIARTL.NS",
     "ITC.NS","HINDUNILVR.NS","ASIANPAINT.NS","KOTAKBANK.NS","AXISBANK.NS","BAJFINANCE.NS","ULTRACEMCO.NS",
     "MARUTI.NS","SUNPHARMA.NS","HCLTECH.NS","TITAN.NS","WIPRO.NS","ONGC.NS","NTPC.NS","TATASTEEL.NS",
@@ -64,13 +63,26 @@ def load_tickers(file: Path | None) -> list[str]:
 def fetch_ohlcv(tickers: list[str], start: str, end: str) -> dict:
     """Return dict[ticker] -> DataFrame with columns [Open, High, Low, Close, Volume]"""
     data = {}
-    # yfinance multi-download can be messy; loop per ticker for robustness
     for t in tickers:
         try:
             df = yf.download(t, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
             if df.empty:
                 continue
-            df = df.rename(columns=str.title)
+
+            # Flatten MultiIndex columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ["_".join([c for c in col if c]) for col in df.columns]
+
+            # Normalize names
+            df = df.rename(columns={
+                "Open": "Open",
+                "High": "High",
+                "Low": "Low",
+                "Close": "Close",
+                "Adj Close": "AdjClose",
+                "Volume": "Volume"
+            })
+
             df.index.name = "Date"
             data[t] = df
         except Exception as e:
@@ -97,9 +109,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["sma_5"] = out["Close"].rolling(5).mean()
     out["sma_10"] = out["Close"].rolling(10).mean()
     out["sma_20"] = out["Close"].rolling(20).mean()
-    out["sma_ratio"] = out["Close"] / out["sma_10"]
+    out["sma_ratio"] = out["Close"] / out["sma_10"].squeeze()
 
-    # TA indicators (ta lib is pure python)
+    # TA indicators
     out["rsi_14"] = ta.momentum.RSIIndicator(out["Close"], window=14).rsi()
     macd = ta.trend.MACD(out["Close"], window_slow=26, window_fast=12, window_sign=9)
     out["macd"] = macd.macd()
@@ -112,7 +124,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     adx = ta.trend.ADXIndicator(out["High"], out["Low"], out["Close"], window=14)
     out["adx_14"] = adx.adx()
 
-    # Forward label: next-day intraday return (Open->Close) > 0
+    # Forward label
     out["ret_oc_next"] = out["ret_oc"].shift(-1)
     out["y"] = (out["ret_oc_next"] > 0).astype(int)
 
@@ -137,20 +149,18 @@ def build_dataset(data_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     all_df = pd.concat(frames, ignore_index=True)
-    all_df = all_df.dropna(subset=FEATURES + ["y"])  # drop rows with NaNs in features/label
+    all_df = all_df.dropna(subset=FEATURES + ["y"])
     return all_df
 
 # ---------------------------
-# Train model (pooled across tickers)
+# Train model
 # ---------------------------
 
 def train_model(all_df: pd.DataFrame) -> tuple[Pipeline, dict]:
     all_df = all_df.sort_values("Date")
-
     X = all_df[["ticker"] + FEATURES].copy()
     y = all_df["y"].astype(int).values
 
-    # One-hot encode ticker, passthrough numerical features
     pre = ColumnTransformer(
         transformers=[
             ("tick", OneHotEncoder(handle_unknown="ignore"), ["ticker"]),
@@ -158,11 +168,9 @@ def train_model(all_df: pd.DataFrame) -> tuple[Pipeline, dict]:
         ]
     )
 
-    clf = RandomForestClassifier(n_estimators=300, max_depth=None, min_samples_leaf=5, n_jobs=-1, random_state=42)
-
+    clf = RandomForestClassifier(n_estimators=300, min_samples_leaf=5, n_jobs=-1, random_state=42)
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
 
-    # TimeSeries CV metrics
     tscv = TimeSeriesSplit(n_splits=5)
     aucs, accs = [], []
     for tr_idx, te_idx in tscv.split(X):
@@ -181,7 +189,6 @@ def train_model(all_df: pd.DataFrame) -> tuple[Pipeline, dict]:
         "splits": len(accs),
     }
 
-    # Fit on all data
     pipe.fit(X, y)
     return pipe, metrics
 
@@ -197,14 +204,12 @@ def latest_signals(model: Pipeline, data_dict: dict[str, pd.DataFrame]) -> pd.Da
         if fe.empty:
             continue
         last_row = fe.iloc[-1]
-        # Prepare a single-row X for prediction using today's features
         Xrow = pd.DataFrame({"ticker": [t], **{f: [last_row[f]] for f in FEATURES}})
         proba = model.predict_proba(Xrow)[:, 1][0]
 
-        # Use ATR for position sizing & stop suggestions
         atr = float(last_row.get("atr_14", np.nan))
-        last_close = float(last_row["Close"]) if "Close" in last_row else float(df["Close"].iloc[-1])
-        last_open = float(last_row["Open"]) if "Open" in last_row else float(df["Open"].iloc[-1])
+        last_close = float(last_row["Close"])
+        last_open = float(last_row["Open"])
 
         rows.append({
             "ticker": t,
@@ -276,14 +281,11 @@ if sigs.empty:
 
 st.subheader(f"Signals for {pd.to_datetime(last_date).date() if last_date is not None else 'latest date'}")
 
-# Position sizing based on ATR
 if "atr14" in sigs.columns:
     risk_rupees = risk_capital * (risk_per_trade / 100.0)
-    # stop distance uses atr_mult * ATR
     sigs["stop_distance"] = sigs["atr14"] * atr_mult
     sigs["qty"] = (risk_rupees / sigs["stop_distance"]).clip(lower=0).round()
 
-# Filter & pick top N
 view = sigs.query("proba_up_next_day >= @min_proba").copy()
 view = view.head(top_n)
 
