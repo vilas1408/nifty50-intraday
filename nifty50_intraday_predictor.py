@@ -1,144 +1,96 @@
+# nifty50_intraday_predictor.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestClassifier
+import time
 
-# =============================
-# Data Fetcher with Debug
-# =============================
-def fetch_ohlcv(tickers: list[str], start: str, end: str) -> dict:
-    """Return dict[ticker] -> DataFrame with columns [Open, High, Low, Close, Volume]"""
-    data = {}
-    for t in tickers:
-        try:
-            df = yf.download(
-                t, start=start, end=end, interval="1d",
-                auto_adjust=False, progress=False
-            )
+st.set_page_config(page_title="Nifty50 Intraday Predictor", layout="wide")
 
-            if df.empty:
-                st.warning(f"⚠️ No data for {t}")
-                continue
+# ------------------------------
+# Utility Functions
+# ------------------------------
+def load_tickers(filename="tickers.csv"):
+    """Load tickers from CSV"""
+    try:
+        tickers_df = pd.read_csv(filename)
+        return tickers_df["Symbol"].tolist()
+    except Exception as e:
+        st.error(f"Error loading tickers: {e}")
+        return []
 
-            # Flatten MultiIndex if needed
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ["_".join([c for c in col if c]) for col in df.columns]
+def safe_download(ticker, period="5d", interval="5m"):
+    """Download stock data safely from Yahoo Finance"""
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            st.warning(f"⚠️ No data for {ticker}")
+            return None
+        df = df.reset_index()
+        df["Ticker"] = ticker
+        return df
+    except Exception as e:
+        st.error(f"❌ Error fetching {ticker}: {e}")
+        return None
 
-            col_map = {
-                "Open": "Open", "High": "High", "Low": "Low",
-                "Close": "Close", "Adj Close": "AdjClose",
-                "AdjClose": "AdjClose", "Close_Close": "Close",
-                "Open_Open": "Open", "High_High": "High",
-                "Low_Low": "Low", "Volume": "Volume",
-                "Volume_Volume": "Volume"
-            }
-            df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
-            keep_cols = ["Open", "High", "Low", "Close", "Volume"]
-            df = df[[c for c in keep_cols if c in df.columns]]
-
-            if df.empty:
-                st.warning(f"⚠️ Cleaned DataFrame empty for {t}, columns: {df.columns}")
-                continue
-
-            df.index.name = "Date"
-            data[t] = df
-
-            # Debug: show first 2 rows
-            st.write(f"✅ Data for {t}", df.head(2))
-
-        except Exception as e:
-            st.warning(f"❌ Download failed for {t}: {e}")
-    return data
-
-# =============================
-# Feature Engineering
-# =============================
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_features(df):
+    """Feature engineering for signals"""
     out = df.copy()
-    out["ret_close"] = out["Close"].pct_change()
-    out["sma_10"] = out["Close"].rolling(10).mean()
-    out["sma_20"] = out["Close"].rolling(20).mean()
-    out["sma_ratio"] = out["Close"] / out["sma_10"]
-    out["vol_ma"] = out["Volume"].rolling(5).mean()
-    out.dropna(inplace=True)
+    out["Return"] = out["Close"].pct_change()
+    out["SMA_5"] = out["Close"].rolling(5).mean()
+    out["SMA_20"] = out["Close"].rolling(20).mean()
+    out["Signal"] = np.where(out["SMA_5"] > out["SMA_20"], 1, -1)
     return out
 
-# =============================
-# Build Dataset
-# =============================
-def build_dataset(data: dict) -> pd.DataFrame:
-    frames = []
-    for t, df in data.items():
-        fe = add_features(df)
-        fe["ticker"] = t
-        frames.append(fe)
-    if frames:
-        return pd.concat(frames)
-    else:
-        return pd.DataFrame()
+def predict_next_day(df):
+    """Simple rule-based prediction"""
+    try:
+        latest = df.iloc[-1]
+        return "BUY" if latest["Signal"] == 1 else "SELL"
+    except Exception:
+        return "HOLD"
 
-# =============================
-# Model Trainer
-# =============================
-def train_model(df: pd.DataFrame):
-    df = df.copy()
-    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-    df.dropna(inplace=True)
-
-    features = ["ret_close", "sma_ratio", "vol_ma"]
-    X = df[features]
-    y = df["target"]
-
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    return model, features
-
-# =============================
-# Prediction Function
-# =============================
-def predict_next_day(model, features, df: pd.DataFrame):
-    latest = df.iloc[-1:]
-    X_pred = latest[features]
-    prob = model.predict_proba(X_pred)[0, 1]
-    return prob
-
-# =============================
+# ------------------------------
 # Streamlit UI
-# =============================
-st.title("📈 Nifty50 Intraday Next-Day Predictor")
-st.write("Predict which Nifty50 stocks may rise tomorrow.")
+# ------------------------------
+st.title("📈 Nifty50 Intraday Predictor")
+st.markdown("Predicts **next-day intraday BUY/SELL signals** from top Nifty50 stocks.")
 
-uploaded = st.file_uploader("Upload tickers.csv (with column 'symbol')", type=["csv"])
+tickers = load_tickers("tickers.csv")
 
-if uploaded:
-    tickers = pd.read_csv(uploaded)["symbol"].tolist()
-    st.write("Tickers:", tickers)
+if not tickers:
+    st.error("No tickers found in tickers.csv")
+else:
+    st.info(f"Loaded {len(tickers)} tickers from CSV")
 
-    start = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
-    end = datetime.today().strftime("%Y-%m-%d")
+    results = []
+    progress = st.progress(0)
 
-    data = fetch_ohlcv(tickers, start, end)
-    all_df = build_dataset(data)
+    for i, ticker in enumerate(tickers):
+        df = safe_download(ticker, period="5d", interval="5m")
+        if df is None:
+            continue
 
-    if all_df.empty:
-        st.error("No valid data available after processing.")
+        df = add_features(df)
+        signal = predict_next_day(df)
+
+        results.append({
+            "Ticker": ticker,
+            "Last Close": round(df["Close"].iloc[-1], 2),
+            "Signal": signal
+        })
+
+        progress.progress((i + 1) / len(tickers))
+        time.sleep(0.5)  # avoid throttling
+
+    if results:
+        res_df = pd.DataFrame(results)
+        buy_signals = res_df[res_df["Signal"] == "BUY"].sort_values("Last Close", ascending=False)
+
+        st.subheader("✅ Top 5 Stocks to BUY Next Day (Intraday)")
+        st.table(buy_signals.head(5))
+
+        st.subheader("📊 All Predictions")
+        st.dataframe(res_df)
     else:
-        model, features = train_model(all_df)
-
-        results = []
-        for t, df in data.items():
-            try:
-                fe = add_features(df)
-                prob = predict_next_day(model, features, fe)
-                results.append({"Ticker": t, "Prob_Up": prob})
-            except Exception as e:
-                st.warning(f"Prediction failed for {t}: {e}")
-
-        if results:
-            res_df = pd.DataFrame(results).sort_values("Prob_Up", ascending=False)
-            st.subheader("Predicted Top Stocks for Tomorrow")
-            st.dataframe(res_df)
-        else:
-            st.error("No predictions could be made.")
+        st.warning("No valid data fetched for any ticker.")
