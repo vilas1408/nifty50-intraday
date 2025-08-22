@@ -5,4 +5,5 @@ numpy
 plotly
 ta
 scikit-learn
+upstox-python
 upstox-api  # or the name of the Upstox SDK you use; remove if not using Upstox
