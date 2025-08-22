@@ -1,71 +1,24 @@
-# nifty50_intraday_predictor.py
-# Streamlit app to rank NIFTY 50 stocks for next-day intraday buys
-# Disclaimer: Educational use only. Not investment advice.
-
-import warnings
-warnings.filterwarnings("ignore")
-
-import os
-from datetime import datetime, timedelta
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import yfinance as yf
-import ta
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import roc_auc_score, accuracy_score
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-
 import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
-# ---------------------------
-# Config
-# ---------------------------
-st.set_page_config(page_title="NIFTY50 Next-Day Intraday Predictor", layout="wide")
-
-st.title("NIFTY 50 — Next-Day Intraday Buy Candidates (Prototype)")
-st.caption("Educational prototype. Uses daily data + technical features to classify whether tomorrow's intraday (Open→Close) return will be positive.")
-
-# ---------------------------
-# Helper: Load tickers
-# ---------------------------
-DEFAULT_TICKERS = [
-    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","LT.NS","SBIN.NS","BHARTIARTL.NS",
-    "ITC.NS","HINDUNILVR.NS","ASIANPAINT.NS","KOTAKBANK.NS","AXISBANK.NS","BAJFINANCE.NS","ULTRACEMCO.NS",
-    "MARUTI.NS","SUNPHARMA.NS","HCLTECH.NS","TITAN.NS","WIPRO.NS","ONGC.NS","NTPC.NS","TATASTEEL.NS",
-    "POWERGRID.NS","BAJAJFINSV.NS","ADANIENT.NS","GRASIM.NS","ADANIPORTS.NS","M&M.NS","JSWSTEEL.NS",
-    "TATAMOTORS.NS","HDFCLIFE.NS","COALINDIA.NS","BRITANNIA.NS","TECHM.NS","DRREDDY.NS","HEROMOTOCO.NS",
-    "CIPLA.NS","HINDALCO.NS","DIVISLAB.NS","NESTLEIND.NS","BPCL.NS","BAJAJ-AUTO.NS","EICHERMOT.NS",
-    "TATACONSUM.NS","HAVELLS.NS","LTIM.NS","SHRIRAMFIN.NS","APOLLOHOSP.NS","TATAELXI.NS"
-]
-
-@st.cache_data(show_spinner=False)
-def load_tickers(file: Path | None) -> list[str]:
-    if file is not None:
-        try:
-            df = pd.read_csv(file)
-            col = [c for c in df.columns if c.lower().strip() in {"ticker","tickers","symbol","symbols"}]
-            if col:
-                tickers = df[col[0]].dropna().astype(str).str.strip().tolist()
-                return [t if t.endswith('.NS') else f"{t}.NS" for t in tickers]
-        except Exception as e:
-            st.warning(f"Failed to read uploaded tickers CSV: {e}")
-    return DEFAULT_TICKERS
-
-# ---------------------------
-# Download data
-# ---------------------------
-@st.cache_data(show_spinner=True)
+# -------------------------------------------------------------
+# Fetch OHLCV Data with robust column normalization
+# -------------------------------------------------------------
 def fetch_ohlcv(tickers: list[str], start: str, end: str) -> dict:
     """Return dict[ticker] -> DataFrame with columns [Open, High, Low, Close, Volume]"""
     data = {}
     for t in tickers:
         try:
-            df = yf.download(t, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
+            df = yf.download(
+                t, start=start, end=end, interval="1d",
+                auto_adjust=False, progress=False
+            )
             if df.empty:
                 continue
 
@@ -73,15 +26,26 @@ def fetch_ohlcv(tickers: list[str], start: str, end: str) -> dict:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ["_".join([c for c in col if c]) for col in df.columns]
 
-            # Normalize names
-            df = df.rename(columns={
+            # Normalize column names
+            col_map = {
                 "Open": "Open",
                 "High": "High",
                 "Low": "Low",
                 "Close": "Close",
                 "Adj Close": "AdjClose",
-                "Volume": "Volume"
-            })
+                "AdjClose": "AdjClose",
+                "Close_Close": "Close",
+                "Open_Open": "Open",
+                "High_High": "High",
+                "Low_Low": "Low",
+                "Volume": "Volume",
+                "Volume_Volume": "Volume"
+            }
+            df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
+
+            # Keep only required columns
+            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep_cols]
 
             df.index.name = "Date"
             data[t] = df
@@ -89,219 +53,101 @@ def fetch_ohlcv(tickers: list[str], start: str, end: str) -> dict:
             st.warning(f"Download failed for {t}: {e}")
     return data
 
-# ---------------------------
-# Feature engineering
-# ---------------------------
-
+# -------------------------------------------------------------
+# Feature Engineering
+# -------------------------------------------------------------
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # Basic returns
+    if "Close" not in out.columns:
+        return out  # safety fallback
+
     out["ret_close"] = out["Close"].pct_change()
-    out["ret_open"] = out["Open"].pct_change()
-    out["ret_oc"] = out["Close"] / out["Open"] - 1.0  # intraday
-    out["gap"] = out["Open"] / out["Close"].shift(1) - 1.0
-
-    # Volatility
-    out["vol_10"] = out["ret_close"].rolling(10).std()
-    out["vol_20"] = out["ret_close"].rolling(20).std()
-
-    # Moving averages
     out["sma_5"] = out["Close"].rolling(5).mean()
     out["sma_10"] = out["Close"].rolling(10).mean()
-    out["sma_20"] = out["Close"].rolling(20).mean()
     out["sma_ratio"] = out["Close"] / out["sma_10"].squeeze()
-
-    # TA indicators
-    out["rsi_14"] = ta.momentum.RSIIndicator(out["Close"], window=14).rsi()
-    macd = ta.trend.MACD(out["Close"], window_slow=26, window_fast=12, window_sign=9)
-    out["macd"] = macd.macd()
-    out["macd_signal"] = macd.macd_signal()
-    out["macd_hist"] = macd.macd_diff()
-
-    atr = ta.volatility.AverageTrueRange(out["High"], out["Low"], out["Close"], window=14)
-    out["atr_14"] = atr.average_true_range()
-
-    adx = ta.trend.ADXIndicator(out["High"], out["Low"], out["Close"], window=14)
-    out["adx_14"] = adx.adx()
-
-    # Forward label
-    out["ret_oc_next"] = out["ret_oc"].shift(-1)
-    out["y"] = (out["ret_oc_next"] > 0).astype(int)
-
+    out["vol_ma5"] = out["Volume"].rolling(5).mean()
+    out = out.dropna()
     return out
 
-FEATURES = [
-    "gap","ret_close","vol_10","vol_20","sma_ratio","rsi_14","macd","macd_signal","macd_hist",
-    "atr_14","adx_14"
-]
-
-# ---------------------------
-# Build pooled dataset
-# ---------------------------
-
-def build_dataset(data_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    frames = []
-    for t, df in data_dict.items():
-        fe = add_features(df)
-        fe = fe.reset_index()
-        fe.insert(1, "ticker", t)
-        frames.append(fe)
-    if not frames:
-        return pd.DataFrame()
-    all_df = pd.concat(frames, ignore_index=True)
-    all_df = all_df.dropna(subset=FEATURES + ["y"])
-    return all_df
-
-# ---------------------------
-# Train model
-# ---------------------------
-
-def train_model(all_df: pd.DataFrame) -> tuple[Pipeline, dict]:
-    all_df = all_df.sort_values("Date")
-    X = all_df[["ticker"] + FEATURES].copy()
-    y = all_df["y"].astype(int).values
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("tick", OneHotEncoder(handle_unknown="ignore"), ["ticker"]),
-            ("num", "passthrough", FEATURES),
-        ]
-    )
-
-    clf = RandomForestClassifier(n_estimators=300, min_samples_leaf=5, n_jobs=-1, random_state=42)
-    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-
-    tscv = TimeSeriesSplit(n_splits=5)
-    aucs, accs = [], []
-    for tr_idx, te_idx in tscv.split(X):
-        pipe.fit(X.iloc[tr_idx], y[tr_idx])
-        proba = pipe.predict_proba(X.iloc[te_idx])[:, 1]
-        pred = (proba >= 0.5).astype(int)
-        try:
-            aucs.append(roc_auc_score(y[te_idx], proba))
-        except Exception:
-            pass
-        accs.append(accuracy_score(y[te_idx], pred))
-
-    metrics = {
-        "cv_auc_mean": float(np.mean(aucs)) if aucs else np.nan,
-        "cv_acc_mean": float(np.mean(accs)) if accs else np.nan,
-        "splits": len(accs),
-    }
-
-    pipe.fit(X, y)
-    return pipe, metrics
-
-# ---------------------------
-# Generate tomorrow predictions
-# ---------------------------
-
-def latest_signals(model: Pipeline, data_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    rows = []
-    today = None
-    for t, df in data_dict.items():
+# -------------------------------------------------------------
+# Build Dataset
+# -------------------------------------------------------------
+def build_dataset(data: dict) -> pd.DataFrame:
+    dfs = []
+    for ticker, df in data.items():
         fe = add_features(df)
         if fe.empty:
             continue
-        last_row = fe.iloc[-1]
-        Xrow = pd.DataFrame({"ticker": [t], **{f: [last_row[f]] for f in FEATURES}})
-        proba = model.predict_proba(Xrow)[:, 1][0]
+        fe["Ticker"] = ticker
+        fe["Target"] = (fe["ret_close"].shift(-1) > 0).astype(int)
+        dfs.append(fe)
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs)
 
-        atr = float(last_row.get("atr_14", np.nan))
-        last_close = float(last_row["Close"])
-        last_open = float(last_row["Open"])
+# -------------------------------------------------------------
+# Train & Predict
+# -------------------------------------------------------------
+def train_and_predict(df: pd.DataFrame):
+    features = ["ret_close", "sma_5", "sma_10", "sma_ratio", "vol_ma5"]
+    df = df.dropna(subset=features + ["Target"])
+    if df.empty:
+        return None, None, None
 
-        rows.append({
-            "ticker": t,
-            "date": fe.index[-1] if isinstance(fe.index, pd.DatetimeIndex) else df.index[-1],
-            "proba_up_next_day": float(proba),
-            "close": last_close,
-            "open": last_open,
-            "atr14": float(atr),
-            "suggested_stop": round(last_close - 1.0 * atr if not np.isnan(atr) else np.nan, 2),
-            "suggested_target": round(last_close + 1.5 * atr if not np.isnan(atr) else np.nan, 2),
-        })
-        today = rows[-1]["date"]
+    X = df[features]
+    y = df["Target"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-    sigs = pd.DataFrame(rows)
-    if not sigs.empty:
-        sigs = sigs.sort_values("proba_up_next_day", ascending=False)
-    return sigs, today
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
 
-# ---------------------------
-# Sidebar controls
-# ---------------------------
-with st.sidebar:
-    st.header("Universe & Data")
-    uploaded = st.file_uploader("Upload tickers CSV (column: ticker)", type=["csv"])
-    tickers = load_tickers(uploaded)
+    y_pred = model.predict(X_test)
+    report = classification_report(y_test, y_pred, output_dict=True)
 
-    years = st.slider("Years of history", 1, 5, 3)
-    end_date = datetime.today().date()
-    start_date = end_date - timedelta(days=365*years + 10)
+    return model, features, report
 
-    st.markdown("---")
-    st.header("Signal Filter")
-    min_proba = st.slider("Minimum probability (up)", 0.5, 0.9, 0.65, 0.01)
-    top_n = st.slider("Top N picks", 1, 20, 10)
+# -------------------------------------------------------------
+# Streamlit App
+# -------------------------------------------------------------
+st.set_page_config(page_title="Nifty50 Intraday Predictor", layout="wide")
+st.title("📈 Nifty50 Next-Day Intraday Buy Predictor")
 
-    st.markdown("---")
-    st.header("Risk Settings (suggestions)")
-    risk_capital = st.number_input("Risk capital (₹)", min_value=1000, value=50000, step=1000)
-    risk_per_trade = st.number_input("Risk per trade (%)", min_value=0.1, value=1.0, step=0.1)
-    atr_mult = st.slider("Stop ATR multiple", 0.5, 3.0, 1.0, 0.1)
+st.sidebar.header("Settings")
+start = st.sidebar.date_input("Start Date", datetime.today() - timedelta(days=365))
+end = st.sidebar.date_input("End Date", datetime.today())
 
-# ---------------------------
-# Main flow
-# ---------------------------
-with st.spinner("Downloading data & training model..."):
-    data = fetch_ohlcv(tickers, start=start_date.strftime('%Y-%m-%d'), end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'))
-    if not data:
-        st.error("No data fetched. Check tickers or internet connectivity.")
-        st.stop()
+# Sample NIFTY50 tickers (can be replaced with file upload)
+def load_tickers():
+    return [
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+        "KOTAKBANK.NS", "LT.NS", "SBIN.NS", "AXISBANK.NS", "HINDUNILVR.NS"
+    ]
 
+symbols = load_tickers()
+
+if st.sidebar.button("Run Prediction"):
+    st.write("⏳ Fetching data and building model...")
+    data = fetch_ohlcv(symbols, str(start), str(end))
     all_df = build_dataset(data)
+
     if all_df.empty:
-        st.error("No usable rows after feature engineering.")
-        st.stop()
+        st.error("No valid data available.")
+    else:
+        model, features, report = train_and_predict(all_df)
+        if model is None:
+            st.error("Model training failed. Not enough data.")
+        else:
+            st.subheader("Model Performance")
+            st.json(report)
 
-    model, metrics = train_model(all_df)
+            latest = all_df.groupby("Ticker").tail(1)
+            X_latest = latest[features]
+            preds = model.predict(X_latest)
+            latest["Prediction"] = preds
 
-st.subheader("Cross-validated performance (pooled)")
-col1, col2, col3 = st.columns(3)
-col1.metric("Splits", metrics.get("splits", 0))
-col2.metric("CV AUC", f"{metrics.get('cv_auc_mean', float('nan')):.3f}")
-col3.metric("CV Accuracy", f"{metrics.get('cv_acc_mean', float('nan')):.3f}")
+            buys = latest[latest["Prediction"] == 1][["Ticker", "Close"]]
+            st.subheader("Recommended Buys for Next Day")
+            st.dataframe(buys)
 
-sigs, last_date = latest_signals(model, data)
-
-if sigs.empty:
-    st.warning("Could not compute signals.")
-    st.stop()
-
-st.subheader(f"Signals for {pd.to_datetime(last_date).date() if last_date is not None else 'latest date'}")
-
-if "atr14" in sigs.columns:
-    risk_rupees = risk_capital * (risk_per_trade / 100.0)
-    sigs["stop_distance"] = sigs["atr14"] * atr_mult
-    sigs["qty"] = (risk_rupees / sigs["stop_distance"]).clip(lower=0).round()
-
-view = sigs.query("proba_up_next_day >= @min_proba").copy()
-view = view.head(top_n)
-
-st.dataframe(view[["ticker","proba_up_next_day","close","atr14","suggested_stop","suggested_target","qty"]], use_container_width=True)
-
-st.markdown("""
-**How to interpret**
-- *proba_up_next_day*: Model's probability that tomorrow's intraday (Open→Close) return is positive.
-- *suggested_stop/target*: Simple ATR-based markers from today's Close (not a recommendation).
-- *qty*: Risk-based position size using your settings (rounded shares).
-
-**Important**: This is a simplified classification model on end-of-day data. Real intraday trading requires robust execution, slippage, transaction costs, and risk management.
-""")
-
-with st.expander("Show raw engineered dataset (sample)"):
-    st.dataframe(all_df.tail(500), use_container_width=True)
-
-st.markdown("---")
-st.caption("© 2025 Prototype. Educational use only. Not investment advice.")
+else:
+    st.info("Press **Run Prediction** to start.")
