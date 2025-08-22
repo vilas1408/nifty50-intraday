@@ -1,131 +1,123 @@
 # nifty50_intraday_predictor.py
+
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import time
-import plotly.graph_objects as go
+import datetime
 
-st.set_page_config(page_title="Nifty50 Intraday Predictor", layout="wide")
+# Try importing Plotly; fallback to Matplotlib if not available
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    import matplotlib.pyplot as plt
+    HAS_PLOTLY = False
 
-# ------------------------------
-# Utility Functions
-# ------------------------------
-def load_tickers(filename="tickers.csv"):
-    """Load tickers from CSV"""
+# -------------------------------
+# Load NIFTY50 tickers
+# -------------------------------
+NIFTY50_TICKERS = [
+    "ADANIENT.NS","ADANIPORTS.NS","APOLLOHOSP.NS","ASIANPAINT.NS","AXISBANK.NS",
+    "BAJAJ-AUTO.NS","BAJFINANCE.NS","BAJAJFINSV.NS","BPCL.NS","BHARTIARTL.NS",
+    "BRITANNIA.NS","CIPLA.NS","COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS",
+    "EICHERMOT.NS","GRASIM.NS","HCLTECH.NS","HDFCBANK.NS","HDFCLIFE.NS",
+    "HEROMOTOCO.NS","HINDALCO.NS","HINDUNILVR.NS","ICICIBANK.NS","ITC.NS",
+    "INDUSINDBK.NS","INFY.NS","JSWSTEEL.NS","KOTAKBANK.NS","LTIM.NS",
+    "LT.NS","M&M.NS","MARUTI.NS","NTPC.NS","NESTLEIND.NS","ONGC.NS",
+    "POWERGRID.NS","RELIANCE.NS","SBILIFE.NS","SBIN.NS","SUNPHARMA.NS",
+    "TCS.NS","TATACONSUM.NS","TATAMOTORS.NS","TATASTEEL.NS","TECHM.NS",
+    "TITAN.NS","ULTRACEMCO.NS","WIPRO.NS"
+]
+
+# -------------------------------
+# Data Fetch Function
+# -------------------------------
+@st.cache_data
+def get_data(ticker, period="6mo", interval="1d"):
     try:
-        tickers_df = pd.read_csv(filename)
-        return tickers_df["Symbol"].tolist()
-    except Exception as e:
-        st.error(f"Error loading tickers: {e}")
-        return []
-
-def safe_download(ticker, period="5d", interval="5m"):
-    """Download stock data safely from Yahoo Finance"""
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        df = yf.download(ticker, period=period, interval=interval, progress=False, group_by="ticker")
         if df.empty:
-            return None
+            return pd.DataFrame()
         df = df.reset_index()
-        df["Ticker"] = ticker
+        df = df.rename(columns=str.title)  # Normalize column names
+        required_cols = {"Open", "High", "Low", "Close", "Volume"}
+        if not required_cols.issubset(df.columns):
+            return pd.DataFrame()
         return df
     except Exception as e:
-        st.error(f"❌ Error fetching {ticker}: {e}")
-        return None
+        st.warning(f"⚠️ Could not fetch {ticker}: {e}")
+        return pd.DataFrame()
 
+# -------------------------------
+# Feature Engineering
+# -------------------------------
 def add_features(df):
-    """Feature engineering for signals"""
+    if df.empty:
+        return df
     out = df.copy()
-    out["Return"] = out["Close"].pct_change()
-    out["SMA_5"] = out["Close"].rolling(5).mean()
-    out["SMA_20"] = out["Close"].rolling(20).mean()
-    out["Signal"] = np.where(out["SMA_5"] > out["SMA_20"], 1, -1)
+    out["ret_close"] = out["Close"].pct_change()
+    out["sma_10"] = out["Close"].rolling(10).mean()
+    out["sma_ratio"] = out["Close"] / out["sma_10"]
+    out["volatility"] = out["ret_close"].rolling(10).std()
+    out = out.dropna()
     return out
 
-def predict_next_day(df):
-    """Simple rule-based prediction"""
-    try:
-        latest = df.iloc[-1]
-        return "BUY" if latest["Signal"] == 1 else "SELL"
-    except Exception:
+# -------------------------------
+# Prediction Logic (Simple Rule)
+# -------------------------------
+def predict_signal(df):
+    if df.empty:
+        return "NO DATA"
+    last = df.iloc[-1]
+    if last["Close"] > last["sma_10"] and last["ret_close"] > 0:
+        return "BUY"
+    elif last["Close"] < last["sma_10"] and last["ret_close"] < 0:
+        return "SELL"
+    else:
         return "HOLD"
 
-def plot_chart(df, ticker):
-    """Plot candlestick with SMA overlays"""
-    fig = go.Figure()
+# -------------------------------
+# Streamlit App
+# -------------------------------
+st.title("📈 NIFTY50 Intraday Predictor")
+st.markdown("Predict intraday **Buy / Sell / Hold** signals for NIFTY50 stocks")
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df["Datetime"],
-        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price"
-    ))
+ticker = st.selectbox("Select a NIFTY50 stock", NIFTY50_TICKERS)
 
-    # Moving Averages
-    if "SMA_5" in df.columns:
-        fig.add_trace(go.Scatter(x=df["Datetime"], y=df["SMA_5"], line=dict(color="blue", width=1.5), name="SMA 5"))
-    if "SMA_20" in df.columns:
-        fig.add_trace(go.Scatter(x=df["Datetime"], y=df["SMA_20"], line=dict(color="orange", width=1.5), name="SMA 20"))
+# Fetch data
+df = get_data(ticker, period="6mo", interval="1d")
 
-    fig.update_layout(
-        title=f"{ticker} - Candlestick Chart with SMA",
-        xaxis_rangeslider_visible=False,
-        height=500,
-        template="plotly_white"
-    )
-    return fig
-
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-st.title("📈 Nifty50 Intraday Predictor with Charts")
-st.markdown("Predicts **next-day intraday BUY/SELL signals** from top Nifty50 stocks + charts.")
-
-tickers = load_tickers("tickers.csv")
-
-if not tickers:
-    st.error("No tickers found in tickers.csv")
+if df.empty:
+    st.error(f"No data available for {ticker}")
 else:
-    st.info(f"Loaded {len(tickers)} tickers from CSV")
+    fe_df = add_features(df)
+    signal = predict_signal(fe_df)
+    st.subheader(f"Prediction for next day: **{signal}**")
 
-    results = []
-    progress = st.progress(0)
-
-    for i, ticker in enumerate(tickers):
-        df = safe_download(ticker, period="5d", interval="5m")
-        if df is None:
-            continue
-
-        df = add_features(df)
-        signal = predict_next_day(df)
-
-        results.append({
-            "Ticker": ticker,
-            "Last Close": round(df["Close"].iloc[-1], 2),
-            "Signal": signal,
-            "Data": df
-        })
-
-        progress.progress((i + 1) / len(tickers))
-        time.sleep(0.2)  # avoid throttling
-
-    if results:
-        res_df = pd.DataFrame([{"Ticker": r["Ticker"], "Last Close": r["Last Close"], "Signal": r["Signal"]} for r in results])
-        buy_signals = res_df[res_df["Signal"] == "BUY"].sort_values("Last Close", ascending=False)
-
-        st.subheader("✅ Top 5 Stocks to BUY Next Day (Intraday)")
-        st.table(buy_signals.head(5))
-
-        st.subheader("📊 All Predictions")
-        st.dataframe(res_df)
-
-        # Chart Viewer
-        st.subheader("📉 Candlestick Charts with Moving Averages")
-        choice = st.selectbox("Select a stock to view chart", res_df["Ticker"].tolist())
-
-        chart_data = next((r["Data"] for r in results if r["Ticker"] == choice), None)
-        if chart_data is not None:
-            fig = plot_chart(chart_data, choice)
-            st.plotly_chart(fig, use_container_width=True)
+    # Chart
+    st.subheader("Price Chart")
+    if HAS_PLOTLY:
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df["Date"],
+            open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"],
+            name="Candlestick"
+        ))
+        fig.update_layout(title=f"{ticker} Price Chart", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("No valid data fetched for any ticker.")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(df["Date"], df["Close"], label="Close Price")
+        ax.plot(fe_df["Date"], fe_df["sma_10"], label="SMA 10", linestyle="--")
+        ax.set_title(f"{ticker} Price Chart")
+        ax.legend()
+        st.pyplot(fig)
+
+# -------------------------------
+# Show Table
+# -------------------------------
+if not df.empty:
+    st.subheader("Recent Data")
+    st.dataframe(df.tail(10))
